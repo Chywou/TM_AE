@@ -45,7 +45,7 @@ The regression RFs are trained and evaluated on data from `gammas_diffuse/reduce
 
 The repository is structured as follows:
 
-- `paper.pdf`: TODO: the final report in PDF format. It contains a detailed description of the models, experiments, results, and conclusions.
+- `paper.pdf`: the final report in PDF format. It contains a detailed description of the models, experiments, results, and conclusions.
 - `ae_gpu.yml`: Conda configuration file used to create the containerized environment on the **baobab** server.
 - `train_ae.sh`: bash script used to submit autoencoder training jobs on the **baobab** server via the SLURM job manager.
 - `server_report/`: contains all the results and scripts executed on the **baobab** server used to write the report. This folder is structured as follows:
