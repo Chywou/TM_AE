@@ -1,0 +1,466 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import hexagdly
+from torch.utils.data import Dataset, DataLoader, random_split
+import numpy as np
+from ctapipe.io import EventSource
+from ctapipe.instrument.camera import CameraGeometry
+from ctapipe.image.cleaning import tailcuts_clean, apply_time_delta_cleaning
+from ctapipe.image import hillas_parameters, leakage_parameters
+
+import glob
+import os
+import argparse
+import time
+import random
+from datetime import datetime
+import random
+from collections import deque
+import yaml
+import pandas as pd
+import h5py
+
+# GPU check
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def clean_image_improvement(peak, mask, adj_list, max_diff=5):
+    new_mask = mask.copy().astype(np.uint8)
+    queue = deque(np.where(new_mask == 1)[0])
+
+    while queue:
+        i = queue.popleft()
+        for n in adj_list[i]:
+            if new_mask[n] == 0 and abs(peak[i] - peak[n]) <= max_diff:
+                new_mask[n] = 1
+                queue.append(n)
+
+    return new_mask
+
+def creat_x_y(x, y):
+    unique_vals = np.sort(np.unique(y))
+    y_new = np.floor(len(unique_vals) / 2).astype(int)
+    mapping = {val: i // 2 for i, val in enumerate(unique_vals)}
+    y_new = np.array([mapping[val] for val in y])
+
+    unique_vals = np.sort(np.unique(x))
+    mapping = {val: i for i, val in enumerate(unique_vals)}
+    x_new = np.array([mapping[val] for val in x])
+
+    return x_new, y_new
+
+proton_path = "/mnt_data/SST1M/data/protons_diffuse/reduce_train"
+
+file_list = glob.glob(os.path.join(proton_path, "*.h5"))
+with EventSource(file_list[0]) as source:
+    for i, event in enumerate(source):
+        for tel_id, tel_event in event.dl1.tel.items():
+            geo = source.subarray.tel[tel_id].camera.geometry
+        break
+neighbors = geo.neighbors
+
+x_new, y_new = creat_x_y(geo.pix_x.value, geo.pix_y.value)
+H = len(np.unique(y_new))
+W = len(np.unique(x_new)) + 1
+
+def load_data(folder_path, max_events=None):
+    telescopes = ["tel_001"]
+    images_list = []
+    masks_list = []
+    peaks_list = []
+    true_energy_list = []
+
+    file_list = glob.glob(os.path.join(folder_path, "*.h5"))
+    random.seed(0)
+    random.shuffle(file_list)
+    print(f"Found {len(file_list)} files", flush=True)
+
+    for file_idx, file_path in enumerate(file_list, 1):
+        print(f"Processing file {file_idx}/{len(file_list)}", flush=True)
+        with h5py.File(file_path, "r") as f:
+            
+            ds_energy = f["simulation/event/subarray/shower"][:]
+            energy_by_event = {
+                row["event_id"]: row["true_energy"]
+                for row in ds_energy
+            }
+
+            for tel in telescopes:
+                ds_image = f[f"dl1/event/telescope/images/{tel}"][:]
+                ds_params = f[f"dl1/event/telescope/parameters/{tel}"][:]
+
+                n_events = ds_image.shape[0]
+
+                for i in range(n_events):
+
+                    image = ds_image[i]["image"].astype(np.float32)
+                    peak = ds_image[i]["peak_time"].astype(np.float32)
+
+                    mask = tailcuts_clean(geo, image, picture_thresh=8, boundary_thresh=4, keep_isolated_pixels=False, min_number_picture_neighbors=2)
+                    mask_modified = apply_time_delta_cleaning(geo, mask, peak, min_number_neighbors=1, time_limit=8)
+
+                    if np.sum(mask_modified) <= 2:
+                        continue
+
+                    hillas = hillas_parameters(geo[mask_modified], image[mask_modified])
+                    leakage = leakage_parameters(geo, image, mask_modified)
+
+                    if hillas.intensity <= 50:
+                        continue
+
+                    if leakage.pixels_width_2 >= 0.7:
+                        continue
+
+                    event_id = ds_params[i]["event_id"]
+                    true_energy = energy_by_event[event_id]
+
+                    images_list.append(image)
+                    peaks_list.append(peak)
+                    masks_list.append(mask_modified)
+                    true_energy_list.append(true_energy.astype(np.float32))
+
+                    if max_events is not None and len(images_list) >= max_events:
+                        return images_list, masks_list, peaks_list, true_energy_list
+
+    return images_list, masks_list, peaks_list, true_energy_list
+
+class TelescopeDataset(Dataset):
+    def __init__(self, folder_path, max_events=None):
+
+        self.folder_path = folder_path
+        self.images = []
+        self.masks = []
+        self.originals = []
+        self.true_energies = []
+
+        start_total = time.time()
+        images, masks, peaks, true_energies = load_data(folder_path, max_events=max_events)
+        self.true_energies = true_energies
+        print(f"Loaded {len(images)} events.", flush=True)
+        print("Applying preprocessing...", flush=True)
+
+        self._build_dataset(images, masks, peaks)
+
+        end_total = time.time()
+        print(f"Total loading time: {end_total - start_total:.2f} seconds", flush=True)
+        print(f"Total events loaded: {len(self.images)}", flush=True)
+
+        self.image_shape = self.images[0].shape
+
+    def _build_dataset(self, images, masks, peaks):
+        for image, msk, pk in zip(images, masks, peaks):
+
+            new_mask = clean_image_improvement(pk, msk, neighbors, max_diff=5)
+
+            # Preprocess the image
+            img = np.clip(image, 0, None)
+            img = img * new_mask 
+            img = np.log1p(img)
+
+            img_tensor = torch.zeros((H, W), dtype=torch.float32)
+            mask_tensor = torch.zeros((H, W), dtype=torch.float32)
+
+            img_tensor[y_new, x_new + 1] = torch.from_numpy(img.astype(np.float32))
+            mask_tensor[y_new, x_new + 1] = torch.from_numpy(new_mask.astype(np.float32))
+
+            self.images.append(img_tensor)
+            self.masks.append(mask_tensor)
+
+            self.originals.append(image)
+    
+    def get_true_energies(self):
+        return self.true_energies
+
+    def get_originals(self):
+        return self.originals
+                                                          
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.images[idx].unsqueeze(0), self.masks[idx].unsqueeze(0)
+    
+class AE(nn.Module):
+    def __init__(
+        self,
+        in_channels=1,
+        enc1_out=8,
+        enc2_out=4,
+        latent_dim=64,
+        k1=2,
+        k2=1,
+    ):
+        super().__init__()
+
+        # =========
+        # Encoder
+        # =========
+        self.enc1 = hexagdly.Conv2d(
+            in_channels=in_channels,
+            out_channels=enc1_out,
+            kernel_size=k1,
+            stride=2,
+            bias=True,
+        )
+        self.bn1 = nn.BatchNorm2d(enc1_out)
+
+        self.enc2 = hexagdly.Conv2d(
+            in_channels=enc1_out,
+            out_channels=enc2_out,
+            kernel_size=k2,
+            stride=2,
+            bias=True,
+        )
+        self.bn2 = nn.BatchNorm2d(enc2_out)
+
+        self.flatten = nn.Flatten()
+        self.fc_enc = nn.Linear(enc2_out * 9 * 13, latent_dim)
+
+        # =========
+        # Decoder
+        # =========
+        self.fc_dec = nn.Linear(latent_dim, enc2_out * 9 * 13)
+        self.unflatten = nn.Unflatten(1, (enc2_out, 9, 13))
+
+        self.dec1 = hexagdly.Conv2d(
+            in_channels=enc2_out,
+            out_channels=enc1_out,
+            kernel_size=k2,
+            stride=1,
+            bias=True,
+        )
+        self.bn3 = nn.BatchNorm2d(enc1_out)
+
+        self.dec2 = hexagdly.Conv2d(
+            in_channels=enc1_out,
+            out_channels=in_channels,
+            kernel_size=k1,
+            stride=1,
+            bias=True,
+        )
+
+    def forward(self, x):
+        H, W = x.shape[-2:]
+
+        # =========
+        # Encoder
+        # =========
+        z = F.relu(self.bn1(self.enc1(x)))
+        z_first_shape = z.shape[-2:]
+
+        z = F.relu(self.bn2(self.enc2(z)))
+
+        z = self.flatten(z)
+        latent = self.fc_enc(z)
+
+        # =========
+        # Decoder
+        # =========
+        z = self.fc_dec(latent)
+        z = self.unflatten(z)
+
+        z = F.interpolate(z, size=z_first_shape, mode="nearest")
+        z = F.relu(self.bn3(self.dec1(z)))
+
+        z = F.interpolate(z, size=(H, W), mode="nearest")
+        out = self.dec2(z)
+
+        return out
+
+    
+def reconstruct_dataset(model, dataset, batch_size=16):
+    model.eval()
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    originals = []
+    normalized = []
+    reconstructed = []
+    mask_list = []
+
+    with torch.no_grad():
+        for images, masks in dataloader:   
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+
+            normalized.append(images.cpu())
+            reconstructed.append(outputs.cpu())
+            mask_list.append(masks.cpu())
+
+    originals = dataset.get_originals()
+    normalized = torch.cat(normalized, dim=0)
+    reconstructed = torch.cat(reconstructed, dim=0)
+    mask_list = torch.cat(mask_list, dim=0)
+
+    return originals, normalized, reconstructed, mask_list
+
+def reconstruction_error(original, reconstructed, masks, criterion):
+    print(f"Shape original: {original.shape}, Shape reconstructed: {reconstructed.shape}")
+
+    loss = criterion(reconstructed, original)
+    masked_loss = loss * masks
+    per_img_loss = masked_loss.sum(dim=(1,2,3)) / (masks.sum(dim=(1,2,3)))
+    return per_img_loss.numpy()
+
+
+def main(data_path_train_protons, data_path_train_gammas, data_path_test_protons, data_path_test_gammas, model_save_dir, epochs=10, batch_size=64, max_events=None, max_events_test=70000):
+    # Load dataset
+
+    print(f"Loading dataset from: {data_path_train_protons} and {data_path_train_gammas}", flush=True)
+    start_time = time.time()
+    dataset_1 = TelescopeDataset(data_path_train_protons, max_events=max_events)
+    dataset_2 = TelescopeDataset(data_path_train_gammas, max_events=len(dataset_1))
+    dataset = torch.utils.data.ConcatDataset([dataset_1, dataset_2])
+    end_time = time.time()
+    print(f"Dataset loaded in {end_time - start_time:.2f} seconds")
+
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize model, criterion, optimizer
+    model = AE().to(device)
+    
+    criterion = nn.MSELoss(reduction='none')
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Training loop
+    print("Starting training...", flush=True)
+
+    train_loss_history = []
+    val_loss_history = []
+
+    for epoch in range(epochs):
+        epoch_start = time.time()
+
+        # Training
+        model.train()
+        train_loss = 0.0
+
+        for images, masks in train_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+
+            loss_per_pixel = criterion(outputs, images)
+            loss = loss_per_pixel.mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * images.size(0)
+
+
+        train_loss /= len(train_dataset)
+        train_loss_history.append(train_loss)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+
+                outputs = model(images)
+                loss_per_pixel = criterion(outputs, images)
+                loss = loss_per_pixel.mean()
+                
+                val_loss += loss.item() * images.size(0)
+
+        val_loss /= len(val_dataset)
+        val_loss_history.append(val_loss)
+        epoch_end = time.time()
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Cost: {train_loss:.8f}, Val Cost: {val_loss:.8f}, Duration: {epoch_end - epoch_start:.2f}s", flush=True)
+
+    print("\n=== Computing reconstruction errors on TEST SET ===")
+
+    criterion = nn.MSELoss(reduction='none')
+
+    # Protons test
+    dataset_protons = TelescopeDataset(data_path_test_protons, max_events=max_events_test)
+    original_protons, norm_protons, rec_protons, masks_protons = reconstruct_dataset(model, dataset_protons)
+    energies_protons = dataset_protons.get_true_energies()
+    err_protons = reconstruction_error(norm_protons, rec_protons, masks_protons, criterion)
+
+    # Gammas test
+    dataset_gammas = TelescopeDataset(data_path_test_gammas, max_events=len(dataset_protons))
+    original_gammas, norm_gammas, rec_gammas, masks_gammas = reconstruct_dataset(model, dataset_gammas)
+    energies_gammas = dataset_gammas.get_true_energies()
+    err_gammas = reconstruction_error(norm_gammas, rec_gammas, masks_gammas, criterion)
+
+    print("Median MSE protons:", np.median(err_protons))
+    print("Median MSE gammas:", np.median(err_gammas))
+
+    # Generate timestamped filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # CSV protons
+    df_protons = pd.DataFrame({"error": err_protons})
+    df_protons_energy = pd.DataFrame({"true_energy": energies_protons})
+    csv_protons_path = os.path.join(model_save_dir, f"errors_protons_{timestamp}.csv")
+    csv_protons_energy_path = os.path.join(model_save_dir, f"energies_protons_{timestamp}.csv")
+    df_protons.to_csv(csv_protons_path, index=False)
+    df_protons_energy.to_csv(csv_protons_energy_path, index=False)
+    print(f"Saved protons errors to: {csv_protons_path}")
+    print(f"Saved protons energies to: {csv_protons_energy_path}")
+
+    # CSV gammas
+    df_gammas = pd.DataFrame({"error": err_gammas})
+    df_gammas_energy = pd.DataFrame({"true_energy": energies_gammas})
+    csv_gammas_path = os.path.join(model_save_dir, f"errors_gammas_{timestamp}.csv")
+    csv_gammas_energy_path = os.path.join(model_save_dir, f"energies_gammas_{timestamp}.csv")
+    df_gammas.to_csv(csv_gammas_path, index=False)
+    df_gammas_energy.to_csv(csv_gammas_energy_path, index=False)
+    print(f"Saved gammas errors to: {csv_gammas_path}")
+
+    model_filename = f"autoencoder_{timestamp}.pth"
+    model_save_path = os.path.join(model_save_dir, model_filename)
+    
+    # Save model
+    print(f"Saving model to: {model_save_path}")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_loss_history': train_loss_history,
+        'val_loss_history': val_loss_history,
+        'epochs': epochs,
+        'batch_size': batch_size,
+        'timestamp': timestamp
+    }, model_save_path)
+    
+    print(f"Model successfully saved as '{model_save_path}'")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Train Autoencoder on telescope data')
+    parser.add_argument('--config', type=str, required=True,
+                       help='Path to YAML configuration file')
+
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+    if not os.path.exists(config["model_save_dir"]):
+        print(f"Creating directory: {config['model_save_dir']}")
+        os.makedirs(config["model_save_dir"], exist_ok=True)
+
+    main(
+        data_path_train_protons=config["path_train_protons"],
+        data_path_train_gammas=config["path_train_gammas"],
+        data_path_test_protons=config["path_test_protons"],
+        data_path_test_gammas=config["path_test_gammas"],
+        model_save_dir=config["model_save_dir"],
+        epochs=config.get("epochs", 20),
+        batch_size=config.get("batch_size", 64),
+        max_events=config.get("max_events", None),
+        max_events_test=config.get("max_events_test", 70000)
+    )

@@ -1,0 +1,9 @@
+model_save_dir: ./output
+ae_model_path: autoencoder_model.pth
+max_events: 100000
+max_events_test: 70000
+path_train_protons: /mnt_data/SST1M/data/protons_diffuse/reduce_train
+path_train_gammas: /mnt_data/SST1M/data/gammas_diffuse/reduce_train
+path_test_protons: /mnt_data/SST1M/data/protons_diffuse/reduce_test
+path_test_gammas: /mnt_data/SST1M/data/gammas_diffuse/reduce_test
+
